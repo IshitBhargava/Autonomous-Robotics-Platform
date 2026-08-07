@@ -2,52 +2,69 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_ADS1X15.h>
 #include <Adafruit_VL53L0X.h>
 #include <Adafruit_TCS34725.h>
 #include <Adafruit_PWMServoDriver.h>
 
-#define BASE 0        // Actuator Channel on the driver
-#define GRIPPER 1     // Actuator Channel on the driver
-#define SHOULDER 2    // Actuator Channel on the driver
-#define W_ROT 3       // Actuator Channel on the driver
-#define W_PIT 4       // Actuator Channel on the driver
-#define ELBOW 5       // Actuator Channel on the driver
-#define CAM_YAW 6     // Actuator Channel on the driver
-#define CAM_PIT 7     // Actuator Channel on the driver
-#define MOTOR_BL 12   // Actuator Channel on the driver
-#define MOTOR_BR 14   // Actuator Channel on the driver
-#define MOTOR_FL 13   // Actuator Channel on the driver
-#define MOTOR_FR 15   // Actuator Channel on the driver
-
-#define BUTTON_PIN   4     // Should be color sensor interupt
-#define BUTTON2_PIN  19    // reported over serial only, does NOT touch the LEDs
-#define LED1_PIN     17    // LED on arm tip
-#define LED2_PIN     0     // strapping pin, fine once booted, white led
-#define BUZZER_PIN   18    // passive buzzer, driven via standard tone()
-
+#define BASE 0                 // Actuator Channel on the driver
+#define GRIPPER 1              // Actuator Channel on the driver
+#define SHOULDER 2             // Actuator Channel on the driver
+#define W_ROT 3                // Actuator Channel on the driver
+#define W_PIT 4                // Actuator Channel on the driver
+#define ELBOW 5                // Actuator Channel on the driver
+#define CAM_YAW 6              // Actuator Channel on the driver
+#define CAM_PIT 7              // Actuator Channel on the driver
+#define MOTOR_BL 12            // Actuator Channel on the driver
+#define MOTOR_BR 14            // Actuator Channel on the driver
+#define MOTOR_FL 13            // Actuator Channel on the driver
+#define MOTOR_FR 15            // Actuator Channel on the driver
+#define BUTTON_PIN   4         // Should be color sensor interupt
+#define BUTTON2_PIN  19        // reported over serial only, does NOT touch the LEDs
+#define LED1_PIN     17        // LED on arm tip
+#define LED2_PIN     0         // strapping pin, fine once booted, white led
+#define BUZZER_PIN   18        // passive buzzer, driven via standard tone()
 #define TCA9548A_ADDR   0x71   // A0 tied high -> 0x71
 #define PCA9685_ADDR    0x40   // main bus, not muxed
-#define ADS1115_ADDR    0x48   // 4-channel ADC I2C Address 
+#define ADS1115_ADDR    0x48   // 4-channel ADC I2C Address
+#define MPU_ADDR 0x68          //  MPU6050 Address
+#define SERVO_COUNT   16       // Channels on PCA9685 (0-15, end inclusive)
 
-#define SERVO_COUNT   16  // Channels on PCA9685 (0-15, end inclusive)
-
-const float threshold_lidar=3501;
-
+const float threshold_lidar=3501;             // to limit false readings or out-of-range 8192 reading
+const float ACC_SENS = 16384.0;
+const float GYRO_SENS = 131.0;
 const uint8_t VL_CHANNELS[4] = {7, 6, 5, 4};  // Channel for the LIDARs on the Mux
 const uint8_t TCS_CHANNEL    = 3;             // Channel for the color sensor on the Mux 
+const uint32_t LIDAR_PERIOD  = 28;            // 35.5 Hz    to boost, running far below, library seems to not use continious mode but instead blocking
+const uint32_t COLOR_PERIOD  = 105;           // 9.5 Hz     
+const uint32_t ADC_PERIOD    = 17;            // 58.8 Hz
+const uint32_t BUTTON_PERIOD = 20;            // 50 Hz
+const uint32_t IMU_PERIOD    = 10;            // 100 Hz     to boost, running far below 
+const uint32_t SERVO_PERIOD  = 1;             // 1000 Hz
+uint32_t tLidar = 0, tColor = 0, tAdc = 0, tButton = 0, tImu = 0, tServo = 0;
+uint32_t lastMPUus = 0;
+uint8_t serialIdx = 0;
+unsigned long lastTime;
+float roll = 0, pitch = 0, yaw = 0;
+float gyroXoffset = 0, gyroYoffset = 0, gyroZoffset = 0;
+float ALPHA = 0.98;
+float lastGX = 0, lastGY = 0, lastGZ = 0;
+float lastAX = 0, lastAY = 0, lastAZ = 0;
+float rollOffset = 0;
+float pitchOffset = 0;
+bool ledState1 = false;
+bool ledState2 = false;
+bool sensor_health=true;
+bool vl53_ready[4] = {false, false, false, false};
+bool lastButtonState = HIGH;
+bool lastButton2State = HIGH;                
+char serialBuf[64];                          
 
-// ================= Sensor / Driver Instances =================
-
-Adafruit_MPU6050       mpu;                                                                               // Object
 Adafruit_ADS1115       ads;                                                                               // Object
 Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver(PCA9685_ADDR);                                      // Object
 Adafruit_VL53L0X       vl53[4];                                                                           // Object
 Adafruit_TCS34725      tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_101MS, TCS34725_GAIN_4X);         // Object
-
-// ================= Servo config =================
 
 struct ServoState {
   float current;   // deg
@@ -58,187 +75,95 @@ struct ServoState {
 
 ServoState servos[SERVO_COUNT];
 
-bool ledState1 = false;
-bool ledState2 = false;
-bool sensor_health=true;
-bool vl53_ready[4] = {false, false, false, false};
-
-const uint32_t LIDAR_PERIOD  = 28;   // ~35.5 Hz
-const uint32_t COLOR_PERIOD  = 105;   // 9.5~ Hz
-const uint32_t ADC_PERIOD    = 17;   // ~58.8 Hz
-const uint32_t BUTTON_PERIOD = 20;   // 50 Hz
-const uint32_t IMU_PERIOD    = 10;   // 100 Hz
-const uint32_t SERVO_PERIOD  = 20;   // 50 Hz
-
-uint32_t tLidar = 0, tColor = 0, tAdc = 0, tButton = 0, tImu = 0, tServo = 0;
-
 void servoWriteDeg(uint8_t channel, float deg);
 
-// ================= Multiplexer Helper =================
 void muxSelect(uint8_t channel) {
   Wire.beginTransmission(TCA9548A_ADDR);
   Wire.write(1 << channel);
   Wire.endTransmission();
 }
 
-// ================= MPU6050 Data =================
-float roll = 0, pitch = 0, yaw = 0;
-uint32_t lastMPUus = 0;
-
-float gyroBiasX = 0, gyroBiasY = 0, gyroBiasZ = 0;
-
-// Rotation matrix that maps raw sensor-frame readings into the level body frame.
-// Built once at boot from the measured gravity vector, so a tilted/skewed IMU
-// mount is compensated for instead of just averaged out as a "bias".
-float mountR[3][3] = {
-  {1,0,0},
-  {0,1,0},
-  {0,0,1}
-};
-
-float lastGX = 0, lastGY = 0, lastGZ = 0;
-float lastAX = 0, lastAY = 0, lastAZ = 0;
-
-// Builds mountR such that mountR * a_measured (normalized) = (0,0,1).
-// Assumes the robot is resting level (chassis-level, not necessarily IMU-level)
-// at the moment mpu6050Calibrate() runs.
-void computeMountRotation(float ax, float ay, float az) {
-  float mag = sqrt(ax*ax + ay*ay + az*az);
-  if (mag < 1e-6) mag = 1e-6;
-  float from[3] = { ax/mag, ay/mag, az/mag };
-  float to[3]   = { 0, 0, 1 };
-
-  float e = from[0]*to[0] + from[1]*to[1] + from[2]*to[2];
-  float f = fabs(e);
-
-  if (f > 1.0 - 1e-4) {
-    // from and to are (near) parallel or antiparallel -- the standard
-    // cross-product formula is singular here (this is exactly the case
-    // for a Z-inverted mount). Use a robust double-Householder-reflection
-    // construction instead, which has no singularity in this regime.
-    float x[3];
-    float afx = fabs(from[0]), afy = fabs(from[1]), afz = fabs(from[2]);
-    if (afx < afy) {
-      if (afx < afz) { x[0]=1; x[1]=0; x[2]=0; }
-      else           { x[0]=0; x[1]=0; x[2]=1; }
-    } else {
-      if (afy < afz) { x[0]=0; x[1]=1; x[2]=0; }
-      else           { x[0]=0; x[1]=0; x[2]=1; }
-    }
-
-    float u[3] = { x[0]-from[0], x[1]-from[1], x[2]-from[2] };
-    float v[3] = { x[0]-to[0],   x[1]-to[1],   x[2]-to[2]   };
-
-    float uu = u[0]*u[0]+u[1]*u[1]+u[2]*u[2];
-    float vv = v[0]*v[0]+v[1]*v[1]+v[2]*v[2];
-    float uv = u[0]*v[0]+u[1]*v[1]+u[2]*v[2];
-
-    float c1 = (uu > 1e-8) ? 2.0/uu : 0.0;
-    float c2 = (vv > 1e-8) ? 2.0/vv : 0.0;
-    float c3 = c1*c2*uv;
-
-    for (int i = 0; i < 3; i++)
-      for (int j = 0; j < 3; j++)
-        mountR[i][j] = (i==j ? 1.0 : 0.0) - c1*u[i]*u[j] - c2*v[i]*v[j] + c3*v[i]*u[j];
-
-  } else {
-    // Well-conditioned case: standard cross-product formula.
-    float v[3] = {
-      from[1]*to[2] - from[2]*to[1],
-      from[2]*to[0] - from[0]*to[2],
-      from[0]*to[1] - from[1]*to[0]
-    };
-    float h = 1.0 / (1.0 + e);
-
-    mountR[0][0] = e + h*v[0]*v[0];
-    mountR[0][1] = h*v[0]*v[1] - v[2];
-    mountR[0][2] = h*v[0]*v[2] + v[1];
-
-    mountR[1][0] = h*v[0]*v[1] + v[2];
-    mountR[1][1] = e + h*v[1]*v[1];
-    mountR[1][2] = h*v[1]*v[2] - v[0];
-
-    mountR[2][0] = h*v[0]*v[2] - v[1];
-    mountR[2][1] = h*v[1]*v[2] + v[0];
-    mountR[2][2] = e + h*v[2]*v[2];
-  }
+void mpuWrite(uint8_t reg, uint8_t val){
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(reg);
+    Wire.write(val);
+    Wire.endTransmission();
 }
 
-void rotateVec(const float in[3], float out[3]) {
-  out[0] = mountR[0][0]*in[0] + mountR[0][1]*in[1] + mountR[0][2]*in[2];
-  out[1] = mountR[1][0]*in[0] + mountR[1][1]*in[1] + mountR[1][2]*in[2];
-  out[2] = mountR[2][0]*in[0] + mountR[2][1]*in[1] + mountR[2][2]*in[2];
+void mpuReadRaw(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy, int16_t &gz){
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 14, true);
+
+  ax = Wire.read() << 8 | Wire.read();
+  ay = Wire.read() << 8 | Wire.read();
+  az = Wire.read() << 8 | Wire.read();
+  Wire.read(); Wire.read(); // temp, skip
+  gx = Wire.read() << 8 | Wire.read();
+  gy = Wire.read() << 8 | Wire.read();
+  gz = Wire.read() << 8 | Wire.read();
 }
 
 void mpu6050Calibrate() {
-  const int N = 200;
-  double sax = 0, say = 0, saz = 0, sgx = 0, sgy = 0, sgz = 0;
-  sensors_event_t a, g, temp;
+  Serial.println("Calibrating gyro, keep still...");
+  long sx = 0, sy = 0, sz = 0;
+  const int N = 500;
+  int16_t ax, ay, az, gx, gy, gz;
+  double sAccRoll = 0, sAccPitch = 0;
 
-  for (int i = 0; i < N; i++) {
-    mpu.getEvent(&a, &g, &temp);
-    sax += a.acceleration.x / SENSORS_GRAVITY_STANDARD;
-    say += a.acceleration.y / SENSORS_GRAVITY_STANDARD;
-    saz += a.acceleration.z / SENSORS_GRAVITY_STANDARD;
-    sgx += g.gyro.x * 180.0 / PI;
-    sgy += g.gyro.y * 180.0 / PI;
-    sgz += g.gyro.z * 180.0 / PI;
+  for(int i = 0; i < N; i++){
+      mpuReadRaw(ax, ay, az, gx, gy, gz);
+      sx += gx; sy += gy; sz += gz;
+
+      float axg = ax / ACC_SENS;
+      float ayg = ay / ACC_SENS;
+      float azg = az / ACC_SENS;
+
+      sAccRoll  += atan2(ayg, azg) * 180.0 / PI;
+      sAccPitch += atan2(-axg, sqrt(ayg*ayg + azg*azg)) * 180.0 / PI;
+
+      delay(2);
   }
+  gyroXoffset = sx / (float)N;
+  gyroYoffset = sy / (float)N;
+  gyroZoffset = sz / (float)N;
+  rollOffset  = sAccRoll  / N;
+  pitchOffset = sAccPitch / N;
 
-  float gravX = sax / N, gravY = say / N, gravZ = saz / N;
-  gyroBiasX  = sgx / N; gyroBiasY  = sgy / N; gyroBiasZ  = sgz / N;
-
-  // Derive the mount-tilt correction from the measured gravity direction.
-  computeMountRotation(gravX, gravY, gravZ);
+  Serial.println("Calibration done.");
 }
 
 void mpu6050Update() {
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  int16_t ax, ay, az, gx, gy, gz;
+  mpuReadRaw(ax, ay, az, gx, gy, gz);
+  lastAX = ax; lastAY = ay; lastAZ = az;
+  lastGX = gx; lastGY = gy; lastGZ = gz;
 
-  float axRaw = a.acceleration.x / SENSORS_GRAVITY_STANDARD;
-  float ayRaw = a.acceleration.y / SENSORS_GRAVITY_STANDARD;
-  float azRaw = a.acceleration.z / SENSORS_GRAVITY_STANDARD;
+  unsigned long now = micros();
+  float dt = (now - lastTime) / 1000000.0;
+  lastTime = now;
 
-  float gxRaw = (g.gyro.x * 180.0 / PI) - gyroBiasX;
-  float gyRaw = (g.gyro.y * 180.0 / PI) - gyroBiasY;
-  float gzRaw = (g.gyro.z * 180.0 / PI) - gyroBiasZ;
+  float axg = lastAX / ACC_SENS;
+  float ayg = lastAY / ACC_SENS;
+  float azg = lastAZ / ACC_SENS;
 
-  // Transform sensor-frame readings into the level body frame.
-  float accIn[3]  = { axRaw, ayRaw, azRaw };
-  float accOut[3];
-  rotateVec(accIn, accOut);
+  float gxds = (lastGX - gyroXoffset) / GYRO_SENS;
+  float gyds = (lastGY - gyroYoffset) / GYRO_SENS;
+  float gzds = (lastGZ - gyroZoffset) / GYRO_SENS;
 
-  float gyroIn[3] = { gxRaw, gyRaw, gzRaw };
-  float gyroOut[3];
-  rotateVec(gyroIn, gyroOut);
+  float accRoll  = atan2(ayg, azg) * 180.0 / PI - rollOffset;
+  if (accRoll > 180.0)  accRoll -= 360.0;
+  if (accRoll < -180.0) accRoll += 360.0;
 
-  float axg = accOut[0], ayg = accOut[1], azg = accOut[2];
-  float gxds = gyroOut[0], gyds = gyroOut[1], gzds = gyroOut[2];
+  float accPitch = atan2(-axg, sqrt(ayg*ayg + azg*azg)) * 180.0 / PI - pitchOffset;
+  if (accPitch > 180.0)  accPitch -= 360.0;
+  if (accPitch < -180.0) accPitch += 360.0;
 
-  lastAX = axg; lastAY = ayg; lastAZ = azg;
-  lastGX = gxds; lastGY = gyds; lastGZ = gzds;
-
-  float accelRoll  = atan2(ayg, azg) * 180.0 / PI;
-  float accelPitch = atan2(axg, sqrt(ayg * ayg + azg * azg)) * 180.0 / PI;
-
-  uint32_t now = micros();
-  float dt = (lastMPUus == 0) ? 0.01 : (now - lastMPUus) / 1000000.0;
-  lastMPUus = now;
-
-  roll  = 0.94 * (roll  + gxds * dt) + 0.06 * accelRoll;
-  pitch = 0.94 * (pitch + gyds * dt) + 0.06 * accelPitch;
-  yaw  += gzds * dt;
-
-  // NOTE: IMU is no longer used for drive feedback. $MOVE / $ROTATE now set
-  // motor speeds directly and hold them until the next command -- yaw is
-  // still tracked here for telemetry ($IMU line) but nothing closes the
-  // loop on it anymore.
+  roll  = ALPHA * (roll  + gxds * dt) + (1 - ALPHA) * accRoll;
+  pitch = ALPHA * (pitch + gyds * dt) + (1 - ALPHA) * accPitch;
+  yaw   += gzds * dt;
 }
-
-// ================= Buttons =================
-bool lastButtonState = HIGH;
-bool lastButton2State = HIGH;
 
 void buttonPoll() {
   static uint32_t lastDebounce = 0;
@@ -256,7 +181,6 @@ void buttonPoll() {
   }
 }
 
-// ================= ADS1115 (PGA: +-4.096V) =================
 float adsScaled(uint8_t channel) {
   int16_t raw = ads.readADC_SingleEnded(channel);
   // Full scale range is +-4.096V (32767 count = 4.096V)
@@ -266,7 +190,6 @@ float adsScaled(uint8_t channel) {
   return constrain(pct, 0.0f, 100.0f);
 }
 
-// ================= Servo Control =================
 void servoWriteDeg(uint8_t channel, float deg) {
   deg = constrain(deg, 0.0, 180.0);
   if(channel==3){
@@ -290,8 +213,6 @@ void servosUpdate(float dt) {
     servoWriteDeg(ch, servos[ch].current);
   }
 }
-
-// ================= Drive Motor Control =================
 
 void driveMecanum(float vx, float vy) {
   vx = map(constrain(vx, -100.0, 100.0),-100,100,-90,90);
@@ -324,17 +245,13 @@ void driveRotate(float speed) {
   servoWriteDeg(MOTOR_BR,(90+map(speed,-100,100,-90,90)));
 }
 
-  void initServosToBoot(int ch,int deg){
-    servos[ch].current = 90;
-    servos[ch].target = 90;
-    servos[ch].speed = 60;
-    servos[ch].sweeping = false;
-    servoWriteDeg(ch, deg); // Set to active 90 deg position on boot (also = motor stop)
-  }
-
-// ================= Serial Command Parsing =================
-char serialBuf[64];
-uint8_t serialIdx = 0;
+void initServosToBoot(int ch,int deg){
+  servos[ch].current = deg;
+  servos[ch].target = deg;
+  servos[ch].speed = 60;
+  servos[ch].sweeping = false;
+  servoWriteDeg(ch, deg); // Set to active 90 deg position on boot (also = motor stop)
+}
 
 void processCommand(char *line) {
   char *tok = strtok(line, ",");
@@ -350,18 +267,28 @@ void processCommand(char *line) {
     int ch = atoi(chStr);
     if (ch < 0 || ch >= SERVO_COUNT) return;
     float target = constrain((float)atof(targetStr), 0.0, 180.0);
-    bool sweep = (strcmp(sweepStr, "true") == 0);
+    int sweep = atof(sweepStr);
     float speed = atof(speedStr);
 
-    if (sweep) {
+    if (sweep==1) {
       servos[ch].target = target;
       servos[ch].speed = (speed > 0) ? speed : 60.0;
       servos[ch].sweeping = true;
-    } else {
+    } else if(sweep==2){
       servos[ch].current = target;
       servos[ch].target = target;
       servos[ch].sweeping = false;
       servoWriteDeg(ch, target);
+    } else if(sweep==3){
+      servos[ch].target = target;
+      servos[ch].sweeping = true;
+      int step = (target >= servos[ch].current) ? 1 : -1;
+      for(int i = servos[ch].current; i != target + step; i += step){
+          servos[ch].current = i;
+          servoWriteDeg(ch, i);
+          delay(speed);
+      }
+      servos[ch].sweeping = false;
     }
   } else if (strcmp(tok, "$LED") == 0) {
     char *l1 = strtok(NULL, ",");
@@ -436,27 +363,20 @@ void setup() {
   digitalWrite(LED2_PIN, LOW);
   noTone(BUZZER_PIN);
 
-  // Let I2C rails / sensor regulators (VL53L0X, TCS34725 breakouts especially)
-  // settle before the first transaction. The ESP32 boots fast enough that
-  // hitting begin() immediately after Wire.begin() can catch a sensor mid
-  // power-up, which reports a false failure even on healthy hardware. Each
-  // sensor below also gets a few retries as a second layer of defense.
   delay(300);
 
-  // MPU6050
-  {
-    bool ok = false;
-    for (uint8_t attempt = 0; attempt < 3 && !ok; attempt++) {
-      ok = mpu.begin();
-      if (!ok) delay(50);
-    }
-    if (ok) {
-      mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
-      mpu.setGyroRange(MPU6050_RANGE_250_DEG);
-      mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-      mpu6050Calibrate();
-    }
+  mpuWrite(0x6B, 0x00); // wake up
+  mpuWrite(0x1A, 0x01); // DLPF ~184Hz
+  mpuWrite(0x1B, 0x00); // gyro ±250dps
+  mpuWrite(0x1C, 0x00); // accel ±2g
+  delay(100);
+  mpu6050Calibrate();
+
+  ALPHA=0.02;              // initial settling
+  for(int i=0;i<=20;i++){
+    mpu6050Update();
   }
+  ALPHA=0.98;
 
   // ADS1115 -> Set gain to GAIN_ONE (+-4.096V range)
   {
@@ -521,6 +441,7 @@ void setup() {
       delay(200);
     }
   } else {
+    noTone(BUZZER_PIN); delay(4);
     // O4 a, O5 d c — repeated 3x, L8 (125ms)
     tone(BUZZER_PIN, 440); delay(125); noTone(BUZZER_PIN); delay(4); // A4
     tone(BUZZER_PIN, 587); delay(125); noTone(BUZZER_PIN); delay(4);// D5
@@ -544,6 +465,9 @@ void setup() {
     tone(BUZZER_PIN, 587); delay(63); noTone(BUZZER_PIN); delay(4); // D5
     tone(BUZZER_PIN, 523); delay(63); noTone(BUZZER_PIN); delay(4); // C5
   }
+
+  lastTime = micros();
+
 }
 
 void loop() {
