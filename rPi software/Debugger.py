@@ -19,6 +19,11 @@ FIELD_MAP = {
     "$BUTTON": ["Button 1", "Button 2"]
 }
 
+# ---- Global vars for PCA servo motion mode & speed ----
+# mode: 1 = smooth, 2 = direct, 3 = non-blocking
+mode = 1
+speed_val_for_pca = 100
+
 
 class SerialHandler(QtCore.QThread):
     """Thread handling non-blocking serial read & write operations."""
@@ -277,6 +282,49 @@ class SerialPlotterApp(QtWidgets.QMainWindow):
         servo_group = QtWidgets.QGroupBox("PCA9685 Servos (0 - 180°)")
         servo_main_layout = QtWidgets.QVBoxLayout(servo_group)
 
+        # --- Motion mode selector: smooth / direct / non-blocking (mutually exclusive) ---
+        mode_layout = QtWidgets.QHBoxLayout()
+        mode_layout.addWidget(QtWidgets.QLabel("Motion Mode:"))
+
+        self.mode_button_group = QtWidgets.QButtonGroup(self)
+        self.mode_button_group.setExclusive(True)
+
+        self.btn_mode_smooth = QtWidgets.QPushButton("Smooth")
+        self.btn_mode_direct = QtWidgets.QPushButton("Direct")
+        self.btn_mode_nonblocking = QtWidgets.QPushButton("Non-Blocking")
+
+        for btn in (self.btn_mode_smooth, self.btn_mode_direct, self.btn_mode_nonblocking):
+            btn.setCheckable(True)
+            mode_layout.addWidget(btn)
+
+        self.mode_button_group.addButton(self.btn_mode_smooth, 1)
+        self.mode_button_group.addButton(self.btn_mode_direct, 2)
+        self.mode_button_group.addButton(self.btn_mode_nonblocking, 3)
+
+        self.btn_mode_smooth.setChecked(True)  # default mode = 1 (smooth)
+
+        self.mode_button_group.idClicked.connect(self.set_pca_mode)
+
+        mode_layout.addStretch()
+        servo_main_layout.addLayout(mode_layout)
+
+        # --- Master speed slider (1-200) ---
+        speed_layout = QtWidgets.QHBoxLayout()
+        speed_layout.addWidget(QtWidgets.QLabel("Master Speed:"))
+
+        self.slider_pca_speed = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_pca_speed.setRange(1, 200)
+        self.slider_pca_speed.setValue(speed_val_for_pca)
+        speed_layout.addWidget(self.slider_pca_speed)
+
+        self.lbl_pca_speed = QtWidgets.QLabel(str(speed_val_for_pca))
+        self.lbl_pca_speed.setMinimumWidth(35)
+        speed_layout.addWidget(self.lbl_pca_speed)
+
+        self.slider_pca_speed.valueChanged.connect(self.set_pca_speed)
+
+        servo_main_layout.addLayout(speed_layout)
+
         scroll_servo = QtWidgets.QScrollArea()
         scroll_servo.setWidgetResizable(True)
         servo_content = QtWidgets.QWidget()
@@ -455,8 +503,20 @@ class SerialPlotterApp(QtWidgets.QMainWindow):
     def send_custom_beep(self, freq, dur):
         self.send_command(f"$BEEP,{freq},{dur}")
 
+    def set_pca_mode(self, mode_id):
+        """Update the global PCA servo motion mode (1=smooth, 2=direct, 3=non-blocking)."""
+        global mode
+        mode = mode_id
+        print(f"PCA motion mode set to: {mode}")
+
+    def set_pca_speed(self, value):
+        """Update the global PCA servo master speed value."""
+        global speed_val_for_pca
+        speed_val_for_pca = value
+        self.lbl_pca_speed.setText(str(value))
+
     def send_servo_cmd(self, channel, angle):
-        self.send_command(f"$SERVO,{channel},{angle},False,15")
+        self.send_command(f"$SERVO,{channel},{angle},{mode},{speed_val_for_pca}")
 
     def set_all_servos_90(self):
         for ch, slider in enumerate(self.servo_sliders):
